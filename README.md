@@ -270,6 +270,10 @@ Issues, feature requests, and PRs are welcome. Some areas where contributions wo
  </picture>
 </a>
 
+## Translations
+
+Help translate this README — [open a PR](https://github.com/JackChen-me/open-multi-agent/pulls).
+
 ## License
 
 MIT
