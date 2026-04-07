@@ -55,7 +55,7 @@ This is the framework's key feature. When `runTeam()` is called:
 
 ### Concurrency Control
 
-Two independent semaphores: `AgentPool` (max concurrent agent runs, default 5) and `ToolExecutor` (max concurrent tool calls, default 4).
+Three semaphore layers: `AgentPool` pool-level (max concurrent agent runs, default 5), `AgentPool` per-agent mutex (serializes concurrent runs on the same `Agent` instance), and `ToolExecutor` (max concurrent tool calls, default 4).
 
 ### Structured Output
 
