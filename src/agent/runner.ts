@@ -29,10 +29,12 @@ import type {
   LoopDetectionConfig,
   LoopDetectionInfo,
   LLMToolDef,
+  ContextStrategy,
 } from '../types.js'
 import { TokenBudgetExceededError } from '../errors.js'
 import { LoopDetector } from './loop-detector.js'
 import { emitTrace } from '../utils/trace.js'
+import { estimateTokens } from '../utils/tokens.js'
 import type { ToolRegistry } from '../tool/framework.js'
 import type { ToolExecutor } from '../tool/executor.js'
 
@@ -94,6 +96,8 @@ export interface RunnerOptions {
   readonly loopDetection?: LoopDetectionConfig
   /** Maximum cumulative tokens (input + output) allowed for this run. */
   readonly maxTokenBudget?: number
+  /** Optional context compression strategy for long multi-turn runs. */
+  readonly contextStrategy?: ContextStrategy
 }
 
 /**
@@ -172,6 +176,31 @@ function addTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
 
 const ZERO_USAGE: TokenUsage = { input_tokens: 0, output_tokens: 0 }
 
+/**
+ * Prepends synthetic framing text to the first user message so we never emit
+ * consecutive `user` turns (Bedrock) and summaries do not concatenate onto
+ * the original user prompt (direct API). If there is no user message yet,
+ * inserts a single assistant text preamble.
+ */
+function prependSyntheticPrefixToFirstUser(
+  messages: LLMMessage[],
+  prefix: string,
+): LLMMessage[] {
+  const userIdx = messages.findIndex(m => m.role === 'user')
+  if (userIdx < 0) {
+    return [{
+      role: 'assistant',
+      content: [{ type: 'text', text: prefix.trimEnd() }],
+    }, ...messages]
+  }
+  const target = messages[userIdx]!
+  const merged: LLMMessage = {
+    role: 'user',
+    content: [{ type: 'text', text: prefix }, ...target.content],
+  }
+  return [...messages.slice(0, userIdx), merged, ...messages.slice(userIdx + 1)]
+}
+
 // ---------------------------------------------------------------------------
 // AgentRunner
 // ---------------------------------------------------------------------------
@@ -191,6 +220,10 @@ const ZERO_USAGE: TokenUsage = { input_tokens: 0, output_tokens: 0 }
  */
 export class AgentRunner {
   private readonly maxTurns: number
+  private summarizeCache: {
+    oldSignature: string
+    summaryPrefix: string
+  } | null = null
 
   constructor(
     private readonly adapter: LLMAdapter,
@@ -199,6 +232,172 @@ export class AgentRunner {
     private readonly options: RunnerOptions,
   ) {
     this.maxTurns = options.maxTurns ?? 10
+  }
+
+  private serializeMessage(message: LLMMessage): string {
+    return JSON.stringify(message)
+  }
+
+  private truncateToSlidingWindow(messages: LLMMessage[], maxTurns: number): LLMMessage[] {
+    if (maxTurns <= 0) {
+      return messages
+    }
+
+    const firstUserIndex = messages.findIndex(m => m.role === 'user')
+    const firstUser = firstUserIndex >= 0 ? messages[firstUserIndex]! : null
+    const afterFirst = firstUserIndex >= 0
+      ? messages.slice(firstUserIndex + 1)
+      : messages.slice()
+
+    if (afterFirst.length <= maxTurns * 2) {
+      return messages
+    }
+
+    const kept = afterFirst.slice(-maxTurns * 2)
+    const result: LLMMessage[] = []
+
+    if (firstUser !== null) {
+      result.push(firstUser)
+    }
+
+    const droppedPairs = Math.floor((afterFirst.length - kept.length) / 2)
+    if (droppedPairs > 0) {
+      const notice =
+        `[Earlier conversation history truncated — ${droppedPairs} turn(s) removed]\n\n`
+      result.push(...prependSyntheticPrefixToFirstUser(kept, notice))
+      return result
+    }
+
+    result.push(...kept)
+    return result
+  }
+
+  private async summarizeMessages(
+    messages: LLMMessage[],
+    maxTokens: number,
+    summaryModel: string | undefined,
+    baseChatOptions: LLMChatOptions,
+    turns: number,
+    options: RunOptions,
+  ): Promise<{ messages: LLMMessage[]; usage: TokenUsage }> {
+    const estimated = estimateTokens(messages)
+    if (estimated <= maxTokens || messages.length < 4) {
+      return { messages, usage: ZERO_USAGE }
+    }
+
+    const firstUserIndex = messages.findIndex(m => m.role === 'user')
+    if (firstUserIndex < 0 || firstUserIndex === messages.length - 1) {
+      return { messages, usage: ZERO_USAGE }
+    }
+
+    const firstUser = messages[firstUserIndex]!
+    const rest = messages.slice(firstUserIndex + 1)
+    if (rest.length < 2) {
+      return { messages, usage: ZERO_USAGE }
+    }
+
+    // Split on an even boundary so we never separate a tool_use assistant turn
+    // from its tool_result user message (rest is user/assistant pairs).
+    const splitAt = Math.max(2, Math.floor(rest.length / 4) * 2)
+    const oldPortion = rest.slice(0, splitAt)
+    const recentPortion = rest.slice(splitAt)
+
+    const oldSignature = oldPortion.map(m => this.serializeMessage(m)).join('\n')
+    if (this.summarizeCache !== null && this.summarizeCache.oldSignature === oldSignature) {
+      const mergedRecent = prependSyntheticPrefixToFirstUser(
+        recentPortion,
+        `${this.summarizeCache.summaryPrefix}\n\n`,
+      )
+      return { messages: [firstUser, ...mergedRecent], usage: ZERO_USAGE }
+    }
+
+    const summaryPrompt = [
+      'Summarize the following conversation history for an LLM.',
+      '- Preserve user goals, constraints, and decisions.',
+      '- Keep key tool outputs and unresolved questions.',
+      '- Use concise bullets.',
+      '- Do not fabricate details.',
+    ].join('\n')
+
+    const summaryInput: LLMMessage[] = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: summaryPrompt },
+          { type: 'text', text: `\n\nConversation:\n${oldSignature}` },
+        ],
+      },
+    ]
+
+    const summaryOptions: LLMChatOptions = {
+      ...baseChatOptions,
+      model: summaryModel ?? this.options.model,
+      tools: undefined,
+    }
+
+    const summaryStartMs = Date.now()
+    const summaryResponse = await this.adapter.chat(summaryInput, summaryOptions)
+    if (options.onTrace) {
+      const summaryEndMs = Date.now()
+      emitTrace(options.onTrace, {
+        type: 'llm_call',
+        runId: options.runId ?? '',
+        taskId: options.taskId,
+        agent: options.traceAgent ?? this.options.agentName ?? 'unknown',
+        model: summaryOptions.model,
+        phase: 'summary',
+        turn: turns,
+        tokens: summaryResponse.usage,
+        startMs: summaryStartMs,
+        endMs: summaryEndMs,
+        durationMs: summaryEndMs - summaryStartMs,
+      })
+    }
+
+    const summaryText = extractText(summaryResponse.content).trim()
+    const summaryPrefix = summaryText.length > 0
+      ? `[Conversation summary]\n${summaryText}`
+      : '[Conversation summary unavailable]'
+
+    this.summarizeCache = { oldSignature, summaryPrefix }
+    const mergedRecent = prependSyntheticPrefixToFirstUser(
+      recentPortion,
+      `${summaryPrefix}\n\n`,
+    )
+    return {
+      messages: [firstUser, ...mergedRecent],
+      usage: summaryResponse.usage,
+    }
+  }
+
+  private async applyContextStrategy(
+    messages: LLMMessage[],
+    strategy: ContextStrategy,
+    baseChatOptions: LLMChatOptions,
+    turns: number,
+    options: RunOptions,
+  ): Promise<{ messages: LLMMessage[]; usage: TokenUsage }> {
+    if (strategy.type === 'sliding-window') {
+      return { messages: this.truncateToSlidingWindow(messages, strategy.maxTurns), usage: ZERO_USAGE }
+    }
+
+    if (strategy.type === 'summarize') {
+      return this.summarizeMessages(
+        messages,
+        strategy.maxTokens,
+        strategy.summaryModel,
+        baseChatOptions,
+        turns,
+        options,
+      )
+    }
+
+    const estimated = estimateTokens(messages)
+    const compressed = await strategy.compress(messages, estimated)
+    if (!Array.isArray(compressed) || compressed.length === 0) {
+      throw new Error('contextStrategy.custom.compress must return a non-empty LLMMessage[]')
+    }
+    return { messages: compressed, usage: ZERO_USAGE }
   }
 
   // -------------------------------------------------------------------------
@@ -313,7 +512,7 @@ export class AgentRunner {
     options: RunOptions = {},
   ): AsyncGenerator<StreamEvent> {
     // Working copy of the conversation — mutated as turns progress.
-    const conversationMessages: LLMMessage[] = [...initialMessages]
+    let conversationMessages: LLMMessage[] = [...initialMessages]
 
     // Accumulated state across all turns.
     let totalUsage: TokenUsage = ZERO_USAGE
@@ -363,6 +562,19 @@ export class AgentRunner {
 
         turns++
 
+        // Optionally compact context before each LLM call after the first turn.
+        if (this.options.contextStrategy && turns > 1) {
+          const compacted = await this.applyContextStrategy(
+            conversationMessages,
+            this.options.contextStrategy,
+            baseChatOptions,
+            turns,
+            options,
+          )
+          conversationMessages = compacted.messages
+          totalUsage = addTokenUsage(totalUsage, compacted.usage)
+        }
+
         // ------------------------------------------------------------------
         // Step 1: Call the LLM and collect the full response for this turn.
         // ------------------------------------------------------------------
@@ -376,6 +588,7 @@ export class AgentRunner {
             taskId: options.taskId,
             agent: options.traceAgent ?? this.options.agentName ?? 'unknown',
             model: this.options.model,
+            phase: 'turn',
             turn: turns,
             tokens: response.usage,
             startMs: llmStartMs,

@@ -153,6 +153,7 @@ export type {
   ToolCallRecord,
   LoopDetectionConfig,
   LoopDetectionInfo,
+  ContextStrategy,
 
   // Team
   TeamConfig,

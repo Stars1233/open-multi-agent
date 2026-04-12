@@ -65,6 +65,18 @@ export interface LLMMessage {
   readonly content: ContentBlock[]
 }
 
+/** Context management strategy for long-running agent conversations. */
+export type ContextStrategy =
+  | { type: 'sliding-window'; maxTurns: number }
+  | { type: 'summarize'; maxTokens: number; summaryModel?: string }
+  | {
+    type: 'custom'
+    compress: (
+      messages: LLMMessage[],
+      estimatedTokens: number,
+    ) => Promise<LLMMessage[]> | LLMMessage[]
+  }
+
 /** Token accounting for a single API call. */
 export interface TokenUsage {
   readonly input_tokens: number
@@ -215,6 +227,8 @@ export interface AgentConfig {
   readonly maxTokens?: number
   /** Maximum cumulative tokens (input + output) allowed for this run. */
   readonly maxTokenBudget?: number
+  /** Optional context compression policy to control input growth across turns. */
+  readonly contextStrategy?: ContextStrategy
   readonly temperature?: number
   /**
    * Maximum wall-clock time (in milliseconds) for the entire agent run.
@@ -493,6 +507,8 @@ export interface TraceEventBase {
 export interface LLMCallTrace extends TraceEventBase {
   readonly type: 'llm_call'
   readonly model: string
+  /** Distinguishes normal turn calls from context-summary calls. */
+  readonly phase?: 'turn' | 'summary'
   readonly turn: number
   readonly tokens: TokenUsage
 }

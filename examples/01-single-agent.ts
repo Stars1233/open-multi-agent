@@ -114,6 +114,8 @@ const conversationAgent = new Agent(
     model: 'claude-sonnet-4-6',
     systemPrompt: 'You are a TypeScript tutor. Give short, direct answers.',
     maxTurns: 2,
+    // Keep only the most recent turn in long prompt() conversations.
+    contextStrategy: { type: 'sliding-window', maxTurns: 1 },
   },
   new ToolRegistry(), // no tools needed for this conversation
   new ToolExecutor(new ToolRegistry()),

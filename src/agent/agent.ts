@@ -153,6 +153,7 @@ export class Agent {
       agentRole: this.config.systemPrompt?.slice(0, 50) ?? 'assistant',
       loopDetection: this.config.loopDetection,
       maxTokenBudget: this.config.maxTokenBudget,
+      contextStrategy: this.config.contextStrategy,
     }
 
     this.runner = new AgentRunner(
