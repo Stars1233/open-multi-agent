@@ -97,16 +97,15 @@ export class OpenAIAdapter implements LLMAdapter {
         messages: openAIMessages,
         max_tokens: options.maxTokens,
         temperature: options.temperature,
-        frequency_penalty: options.frequencyPenalty ?? 0.1,
+        frequency_penalty: options.frequencyPenalty,
         presence_penalty: options.presencePenalty,
         top_p: options.topP,
         top_k: options.topK,
         min_p: options.minP,
         ...options.extraBody,
         tools: options.tools ? options.tools.map(toOpenAITool) : undefined,
-        parallel_tool_calls: options.tools && options.tools.length > 0 ? false : undefined,
         stream: false,
-      } as any,
+      } as any, // Cast for local OpenAI-compatible servers accepting non-standard params like top_k / min_p
       {
         signal: options.abortSignal,
       },
@@ -142,17 +141,16 @@ export class OpenAIAdapter implements LLMAdapter {
         messages: openAIMessages,
         max_tokens: options.maxTokens,
         temperature: options.temperature,
-        frequency_penalty: options.frequencyPenalty ?? 0.1,
+        frequency_penalty: options.frequencyPenalty,
         presence_penalty: options.presencePenalty,
         top_p: options.topP,
         top_k: options.topK,
         min_p: options.minP,
         ...options.extraBody,
         tools: options.tools ? options.tools.map(toOpenAITool) : undefined,
-        parallel_tool_calls: options.tools && options.tools.length > 0 ? false : undefined,
         stream: true,
         stream_options: { include_usage: true },
-      } as any,
+      } as any, // Cast for local OpenAI-compatible servers accepting non-standard params like top_k / min_p
       {
         signal: options.abortSignal,
       },
@@ -174,8 +172,6 @@ export class OpenAIAdapter implements LLMAdapter {
     // Full text accumulator for the `done` response.
     let fullText = ''
 
-    let inReasoning = false
-
     try {
       for await (const chunk of streamResponse as any) {
         completionId = chunk.id
@@ -192,26 +188,8 @@ export class OpenAIAdapter implements LLMAdapter {
 
         const delta = choice.delta as any
 
-        // --- reasoning delta (DeepSeek R1 / llama-server) ---
-        if (delta.reasoning_content) {
-          if (!inReasoning) {
-             inReasoning = true
-             const startTag = '<think>\n'
-             fullText += startTag
-             yield { type: 'text', data: startTag }
-          }
-          fullText += delta.reasoning_content
-          yield { type: 'text', data: delta.reasoning_content }
-        }
-
         // --- text delta ---
         if (delta.content !== null && delta.content !== undefined) {
-          if (inReasoning) {
-             inReasoning = false
-             const endTag = '\n</think>\n'
-             fullText += endTag
-             yield { type: 'text', data: endTag }
-          }
           fullText += delta.content
           const textEvent: StreamEvent = { type: 'text', data: delta.content }
           yield textEvent
