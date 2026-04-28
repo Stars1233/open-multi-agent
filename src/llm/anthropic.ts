@@ -42,6 +42,7 @@ import type {
   LLMMessage,
   LLMResponse,
   LLMStreamOptions,
+  ReasoningBlock,
   LLMToolDef,
   StreamEvent,
   TextBlock,
@@ -53,6 +54,12 @@ import type {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+type SerializableContentBlock = Exclude<ContentBlock, ReasoningBlock>
+
+function isSerializableContentBlock(block: ContentBlock): block is SerializableContentBlock {
+  return block.type !== 'reasoning'
+}
+
 /**
  * Convert a single framework {@link ContentBlock} into an Anthropic
  * {@link ContentBlockParam} suitable for the `messages` array.
@@ -60,7 +67,7 @@ import type {
  * `tool_result` blocks are only valid inside `user`-role messages, which is
  * handled by {@link toAnthropicMessages} based on role context.
  */
-function toAnthropicContentBlockParam(block: ContentBlock): ContentBlockParam {
+function toAnthropicContentBlockParam(block: SerializableContentBlock): ContentBlockParam {
   switch (block.type) {
     case 'text': {
       const param: TextBlockParam = { type: 'text', text: block.text }
@@ -120,7 +127,9 @@ function toAnthropicContentBlockParam(block: ContentBlock): ContentBlockParam {
 function toAnthropicMessages(messages: LLMMessage[]): MessageParam[] {
   return messages.map((msg): MessageParam => ({
     role: msg.role,
-    content: msg.content.map(toAnthropicContentBlockParam),
+    content: msg.content
+      .filter(isSerializableContentBlock)
+      .map(toAnthropicContentBlockParam),
   }))
 }
 
@@ -145,13 +154,20 @@ function toAnthropicTools(tools: readonly LLMToolDef[]): AnthropicTool[] {
  * Convert an Anthropic SDK `ContentBlock` into a framework {@link ContentBlock}.
  *
  * We only map the subset of SDK types that the framework exposes. Unknown
- * variants (thinking, server_tool_use, etc.) are converted to a text block
- * carrying a stringified representation so data is never silently dropped.
+ * variants are converted to a text block carrying a stringified
+ * representation so data is never silently dropped.
  */
 function fromAnthropicContentBlock(
   block: Anthropic.Messages.ContentBlock,
 ): ContentBlock {
   switch (block.type) {
+    case 'thinking': {
+      const reasoning: ReasoningBlock = {
+        type: 'reasoning',
+        text: block.thinking,
+      }
+      return reasoning
+    }
     case 'text': {
       const text: TextBlock = { type: 'text', text: block.text }
       return text
@@ -166,7 +182,7 @@ function fromAnthropicContentBlock(
       return toolUse
     }
     default: {
-      // Graceful degradation for SDK types we don't model (thinking, etc.).
+      // Graceful degradation for SDK types we don't model.
       const fallback: TextBlock = {
         type: 'text',
         text: `[unsupported block type: ${(block as { type: string }).type}]`,
@@ -257,6 +273,7 @@ export class AnthropicAdapter implements LLMAdapter {
    *
    * Sequence guarantees:
    * - Zero or more `text` events containing incremental deltas
+   * - Zero or more `reasoning` events containing incremental thinking deltas
    * - Zero or more `tool_use` events when the model calls a tool (emitted once
    *   per tool use, after input JSON has been fully assembled)
    * - Exactly one terminal event: `done` (with the complete {@link LLMResponse}
@@ -309,14 +326,26 @@ export class AnthropicAdapter implements LLMAdapter {
           case 'content_block_delta': {
             const delta = event.delta
 
-            if (delta.type === 'text_delta') {
-              const textEvent: StreamEvent = { type: 'text', data: delta.text }
-              yield textEvent
-            } else if (delta.type === 'input_json_delta') {
-              const buf = toolInputBuffers.get(event.index)
-              if (buf !== undefined) {
-                buf.json += delta.partial_json
+            switch (delta.type) {
+              case 'text_delta': {
+                const textEvent: StreamEvent = { type: 'text', data: delta.text }
+                yield textEvent
+                break
               }
+              case 'thinking_delta': {
+                const reasoningEvent: StreamEvent = { type: 'reasoning', data: delta.thinking }
+                yield reasoningEvent
+                break
+              }
+              case 'input_json_delta': {
+                const buf = toolInputBuffers.get(event.index)
+                if (buf !== undefined) {
+                  buf.json += delta.partial_json
+                }
+                break
+              }
+              default:
+                break
             }
             break
           }
