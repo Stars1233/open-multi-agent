@@ -210,6 +210,56 @@ function extractToolUseBlocks(content: readonly ContentBlock[]): ToolUseBlock[] 
   return content.filter((b): b is ToolUseBlock => b.type === 'tool_use')
 }
 
+/**
+ * Boundaries (`startIndex` inclusive, `endIndex` exclusive) of a single
+ * atomic conversation turn within a flat message array.
+ */
+interface Turn {
+  startIndex: number
+  endIndex: number
+}
+
+/**
+ * Group a flat message array into atomic turns so context-management
+ * strategies can split on safe boundaries.
+ *
+ * A turn is one of:
+ *   - a single user / assistant text message, or
+ *   - an assistant message containing one or more `tool_use` blocks plus the
+ *     immediately following user message containing the matching `tool_result`
+ *     blocks (kept together so neither half can be dropped on its own).
+ *
+ * Splitting on turn boundaries — instead of slicing by raw message count —
+ * prevents orphaned `tool_use_id` references that the Anthropic and OpenAI
+ * APIs reject. Modelled on `groupIntoTurns` from the context-chef library.
+ */
+function groupIntoTurns(messages: LLMMessage[]): Turn[] {
+  const turns: Turn[] = []
+  let i = 0
+  while (i < messages.length) {
+    const msg = messages[i]!
+    const hasToolUse =
+      msg.role === 'assistant' && msg.content.some(b => b.type === 'tool_use')
+    if (hasToolUse) {
+      const start = i
+      i++
+      // Absorb the matching tool_result user message, when present.
+      if (
+        i < messages.length
+        && messages[i]!.role === 'user'
+        && messages[i]!.content.some(b => b.type === 'tool_result')
+      ) {
+        i++
+      }
+      turns.push({ startIndex: start, endIndex: i })
+    } else {
+      turns.push({ startIndex: i, endIndex: i + 1 })
+      i++
+    }
+  }
+  return turns
+}
+
 /** Add two {@link TokenUsage} values together, returning a new object. */
 function addTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
   return {
@@ -296,21 +346,39 @@ export class AgentRunner {
       ? messages.slice(firstUserIndex + 1)
       : messages.slice()
 
-    if (afterFirst.length <= maxTurns * 2) {
+    // Walk turns from the tail, accumulating message count until we have at
+    // least `maxTurns * 2` messages — preserving the historical "message-pair
+    // count" semantics of `maxTurns` for plain conversations while never
+    // splitting a tool_use/tool_result pair (see `groupIntoTurns`). The kept
+    // slice may exceed the target by one message when the boundary lands
+    // inside an atomic tool turn — that's the smallest safe slice.
+    const target = maxTurns * 2
+    if (afterFirst.length <= target) {
       return messages
     }
 
-    const kept = afterFirst.slice(-maxTurns * 2)
-    const result: LLMMessage[] = []
+    const turns = groupIntoTurns(afterFirst)
+    let cumulative = 0
+    let cutoffTurnIdx = turns.length
+    for (let i = turns.length - 1; i >= 0; i--) {
+      cumulative += turns[i]!.endIndex - turns[i]!.startIndex
+      cutoffTurnIdx = i
+      if (cumulative >= target) break
+    }
 
+    const keptTurns = turns.slice(cutoffTurnIdx)
+    const keepStartIdx = keptTurns[0]!.startIndex
+    const kept = afterFirst.slice(keepStartIdx)
+    const droppedTurns = turns.length - keptTurns.length
+
+    const result: LLMMessage[] = []
     if (firstUser !== null) {
       result.push(firstUser)
     }
 
-    const droppedPairs = Math.floor((afterFirst.length - kept.length) / 2)
-    if (droppedPairs > 0) {
+    if (droppedTurns > 0) {
       const notice =
-        `[Earlier conversation history truncated — ${droppedPairs} turn(s) removed]\n\n`
+        `[Earlier conversation history truncated — ${droppedTurns} turn(s) removed]\n\n`
       result.push(...prependSyntheticPrefixToFirstUser(kept, notice))
       return result
     }
